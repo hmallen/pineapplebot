@@ -1,7 +1,7 @@
 import os
 import logging
 import re
-import time # Needed for polling delay
+import time
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -10,7 +10,6 @@ from openai import OpenAI, OpenAIError
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 load_dotenv() # Load environment variables from .env file
 
 # --- Constants ---
@@ -29,7 +28,6 @@ try:
     OPENAI_ASSISTANT_ID = os.environ.get("OPENAI_ASSISTANT_ID")
     if not OPENAI_ASSISTANT_ID:
          logging.error("OPENAI_ASSISTANT_ID not found in environment variables.")
-         # Assistant ID is crucial for this version
          openai_client = None # Effectively disable if no assistant ID
 except Exception as e:
     logging.error(f"Error initializing OpenAI client or getting Assistant ID: {e}")
@@ -38,8 +36,7 @@ except Exception as e:
 
 # --- State Management (In-Memory - NOT PRODUCTION READY) ---
 # Stores mapping: Slack thread_ts -> OpenAI thread_id
-# WARNING: This dictionary is lost if the bot restarts.
-# For production, use a database (Redis, SQLite, PostgreSQL, etc.)
+# WARNING: This dictionary is lost if the bot restarts. Use a database for production.
 slack_thread_to_openai_thread = {}
 
 # --- Helper Functions ---
@@ -62,40 +59,32 @@ def clean_mention(text, bot_user_id):
         return re.sub(pattern, '', text).strip()
     return text.strip()
 
-# --- Bot Logic (Assistants API) ---
-
-@app.event("app_mention")
-def handle_mention_assistant(event, say, logger):
-    """Handles mentions using the OpenAI Assistants API."""
+# --- Core Assistant Processing Logic ---
+def process_with_assistant(prompt, slack_thread_ts, channel_id, user_id, say, logger):
+    """Handles the interaction with the OpenAI Assistant for a given prompt and thread."""
     if not openai_client or not OPENAI_ASSISTANT_ID:
-        say("Sorry, the OpenAI connection or Assistant is not configured correctly. Please check server logs.", thread_ts=event.get("ts"))
+        logger.error("OpenAI client or Assistant ID not configured.")
+        # Use say directly as we might not have initiated a thinking message
+        try:
+            say("Sorry, the OpenAI connection or Assistant is not configured correctly. Please check server logs.", thread_ts=slack_thread_ts)
+        except SlackApiError as e:
+            logger.error(f"Slack error reporting config issue: {e}")
         return
-
-    if not BOT_USER_ID:
-         say("Sorry, I couldn't identify my own user ID. Please check the logs.", thread_ts=event.get("ts"))
-         return
-
-    user_message_raw = event.get("text", "")
-    channel_id = event.get("channel")
-    user_id = event.get("user")
-    slack_thread_ts = event.get("thread_ts", event.get("ts")) # Use thread_ts if available, else message ts
-    message_ts = event.get("ts") # Timestamp of the *current* message
-
-    prompt = clean_mention(user_message_raw, BOT_USER_ID)
-
-    logger.info(f"Received mention from {user_id} in channel {channel_id} (Slack thread: {slack_thread_ts}): '{prompt}'")
 
     # --- Acknowledge receipt ---
     thinking_message_ts = None
     try:
+        # Use say function passed from the event handler
         thinking_reply = say(text="🤔 Thinking (using Assistant)...", thread_ts=slack_thread_ts)
         thinking_message_ts = thinking_reply.get('ts') if thinking_reply and thinking_reply.get('ok') else None
-    except Exception as e:
+    except SlackApiError as e:
         logger.error(f"Error posting thinking message: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error posting thinking message: {e}")
 
 
     openai_thread_id = None
-    run = None # Initialize run variable
+    run = None
 
     try:
         # --- 1. Find or Create OpenAI Thread ---
@@ -106,13 +95,11 @@ def handle_mention_assistant(event, say, logger):
             logger.info(f"Creating new OpenAI thread for Slack thread: {slack_thread_ts}")
             thread = openai_client.beta.threads.create()
             openai_thread_id = thread.id
-            slack_thread_to_openai_thread[slack_thread_ts] = openai_thread_id
+            slack_thread_to_openai_thread[slack_thread_ts] = openai_thread_id # WARNING: Store persistently!
             logger.info(f"Created OpenAI thread ID: {openai_thread_id} and mapped to Slack thread: {slack_thread_ts}")
-            # WARNING: In a real app, save this mapping persistently here!
 
         # --- 2. Add User Message to Thread ---
         logger.info(f"Adding message to OpenAI thread {openai_thread_id}: '{prompt}'")
-        # Store the user message ID to potentially fetch only *newer* messages later
         user_openai_message = openai_client.beta.threads.messages.create(
             thread_id=openai_thread_id,
             role="user",
@@ -124,8 +111,6 @@ def handle_mention_assistant(event, say, logger):
         run = openai_client.beta.threads.runs.create(
             thread_id=openai_thread_id,
             assistant_id=OPENAI_ASSISTANT_ID,
-            # Instructions override the default Assistant instructions (optional)
-            # instructions="Focus on providing short answers."
         )
         logger.info(f"Run created with ID: {run.id}, Status: {run.status}")
 
@@ -134,7 +119,7 @@ def handle_mention_assistant(event, say, logger):
         while run.status in ["queued", "in_progress", "cancelling"]:
             if time.time() - start_time > RUN_TIMEOUT_S:
                 logger.warning(f"Run {run.id} timed out after {RUN_TIMEOUT_S} seconds.")
-                openai_client.beta.threads.runs.cancel(thread_id=openai_thread_id, run_id=run.id) # Attempt cancellation
+                openai_client.beta.threads.runs.cancel(thread_id=openai_thread_id, run_id=run.id)
                 raise TimeoutError("Assistant run timed out.")
 
             time.sleep(POLLING_INTERVAL_S)
@@ -145,13 +130,8 @@ def handle_mention_assistant(event, say, logger):
         if run.status == "completed":
             logger.info(f"Run {run.id} completed.")
             # --- 6. Retrieve Assistant Messages ---
-            # List messages *added by this run* (or just latest)
-            # Fetch in descending order to get the newest first
             messages_response = openai_client.beta.threads.messages.list(
-                thread_id=openai_thread_id,
-                order="desc",
-                # limit=1 # Usually the latest message is the response, but sometimes there can be multiple
-                # 'after=user_openai_message.id' could also work but less reliable if assistant adds multiple msgs
+                thread_id=openai_thread_id, order="desc"
             )
             assistant_messages = [m for m in messages_response.data if m.run_id == run.id and m.role == "assistant"]
 
@@ -159,10 +139,9 @@ def handle_mention_assistant(event, say, logger):
                  logger.warning(f"Run {run.id} completed but no new assistant messages found.")
                  ai_response = "I processed your request, but didn't generate a text response."
             else:
-                # Combine multiple assistant messages if necessary (usually just one)
                 ai_response = "\n".join(
                     content_block.text.value
-                    for msg in reversed(assistant_messages) # Reverse to get chronological order if multiple
+                    for msg in reversed(assistant_messages)
                     for content_block in msg.content
                     if content_block.type == 'text'
                 ).strip()
@@ -174,25 +153,23 @@ def handle_mention_assistant(event, say, logger):
             else:
                 say(text=ai_response, thread_ts=slack_thread_ts)
 
-        # Handle other terminal states
         elif run.status == "requires_action":
-            logger.warning(f"Run {run.id} requires action (e.g., function calling) - not handled in this basic bot.")
-            # In a real bot, you'd handle function calls here
+            logger.warning(f"Run {run.id} requires action - not handled.")
             error_message = "Sorry, my current task requires actions I can't perform yet."
             if thinking_message_ts: app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
             else: say(text=error_message, thread_ts=slack_thread_ts)
 
         else: # failed, cancelled, expired
-            logger.error(f"Assistant Run {run.id} ended with status: {run.status}")
-            # Attempt to get error details
-            error_details = "An error occurred."
+            error_details = f"Assistant Run {run.id} ended with status: {run.status}"
             if run.last_error:
                 error_details = f"Run failed: {run.last_error.code} - {run.last_error.message}"
                 logger.error(f"Run {run.id} Last Error: {run.last_error.code} - {run.last_error.message}")
+            else:
+                 logger.error(error_details)
             if thinking_message_ts: app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_details)
             else: say(text=error_details, thread_ts=slack_thread_ts)
 
-
+    # --- Error Handling for the entire process ---
     except OpenAIError as e:
         logger.error(f"OpenAI API Error during Assistant operation: {e}")
         error_message = f"Sorry, I encountered an error with the OpenAI API: {e}"
@@ -203,18 +180,108 @@ def handle_mention_assistant(event, say, logger):
         error_message = "Sorry, the request took too long to process."
         if thinking_message_ts: app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
         else: say(text=error_message, thread_ts=slack_thread_ts)
+    except SlackApiError as e:
+         logger.error(f"Slack API Error during processing or response: {e}")
+         # Avoid trying to respond further if Slack API itself failed
     except Exception as e:
-        logger.exception(f"An unexpected error occurred: {e}") # Includes traceback
+        logger.exception(f"An unexpected error occurred in process_with_assistant: {e}")
         error_message = "Sorry, an unexpected error occurred. See logs for details."
-        if thinking_message_ts: app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
-        else: say(text=error_message, thread_ts=slack_thread_ts)
+        # Try to update/send error message, but be cautious
+        try:
+            if thinking_message_ts: app.client.chat_update(channel=channel_id, ts=thinking_message_ts, text=error_message)
+            else: say(text=error_message, thread_ts=slack_thread_ts)
+        except SlackApiError as slack_e:
+             logger.error(f"Failed to send final error message via Slack: {slack_e}")
+
+
+# --- Slack Event Handlers ---
+
+@app.event("app_mention")
+def handle_mention_assistant(event, say, logger):
+    """Handles direct mentions of the bot."""
+    if not BOT_USER_ID:
+         logger.error("BOT_USER_ID not available, cannot process mention.")
+         # Maybe send a message? Depends on desired behavior.
+         return
+
+    user_message_raw = event.get("text", "")
+    channel_id = event.get("channel")
+    user_id = event.get("user")
+    slack_thread_ts = event.get("thread_ts", event.get("ts"))
+    message_ts = event.get("ts")
+
+    # Clean the mention from the prompt specifically for mentions
+    prompt = clean_mention(user_message_raw, BOT_USER_ID)
+
+    if not prompt:
+        logger.info("Received mention without any text content.")
+        # Optionally reply telling the user to provide input
+        # say("Please provide a message after mentioning me.", thread_ts=slack_thread_ts)
+        return
+
+    logger.info(f"Processing mention from {user_id} in channel {channel_id} (Slack thread: {slack_thread_ts}): '{prompt}'")
+
+    # Call the refactored processing function
+    process_with_assistant(prompt, slack_thread_ts, channel_id, user_id, say, logger)
+
+
+@app.event("message")
+def handle_message_events(message, say, logger):
+    """Handles regular messages in channels/DMs the bot is in."""
+    channel_type = message.get("channel_type") # e.g., 'channel', 'im', 'mpim', 'group'
+
+    # --- Filtering ---
+    # Ignore messages with subtypes (edits, joins, bot messages, etc.)
+    # 'bot_message' subtype specifically filters out messages from other bots AND self
+    # Still check for BOT_USER_ID in case of edge cases or manual message posts via API
+    if message.get("subtype") is not None and message.get("subtype") != "thread_broadcast":
+        # Allow thread_broadcast subtype, ignore others
+        # logger.debug(f"Ignoring message with subtype: {message.get('subtype')}")
+        return
+
+    # Ignore messages from the bot itself (double check)
+    if message.get("user") == BOT_USER_ID or message.get("bot_id"):
+         # logger.debug("Ignoring message from self or a bot.")
+         return
+
+    # Ignore mentions, handled by app_mention (check specifically for start of message)
+    if message.get("text", "").strip().startswith(f"<@{BOT_USER_ID}>"):
+        # logger.debug("Ignoring mention, handled by app_mention handler.")
+        return
+
+    # --- Decide WHERE to respond ---
+    # Respond in DMs ('im')
+    # Respond in channels/groups ('channel', 'group') *only if bot was invited*
+    # Potentially respond in MPIMs ('mpim') - group DMs
+    # >>> Adjust this logic based on desired behavior <<<
+    if channel_type not in ["channel", "group", "im", "mpim"]:
+         logger.debug(f"Ignoring message in unsupported channel type: {channel_type}")
+         return
+
+    # --- Extract Info ---
+    prompt = message.get("text", "")
+    channel_id = message.get("channel")
+    user_id = message.get("user") # Should be present if not a subtype message
+    slack_thread_ts = message.get("thread_ts", message.get("ts"))
+
+    # Basic validation
+    if not prompt or not user_id:
+         logger.warning(f"Message event missing prompt or user_id after filtering. Subtype: {message.get('subtype')}, User: {message.get('user')}, BotID: {message.get('bot_id')}")
+         return
+
+    # --- Process ---
+    logger.info(f"Processing general message from {user_id} in {channel_type} {channel_id} (Slack thread: {slack_thread_ts}): '{prompt}'")
+
+    # Call the refactored processing function
+    process_with_assistant(prompt, slack_thread_ts, channel_id, user_id, say, logger)
 
 
 # --- Start the Bot ---
 if __name__ == "__main__":
     required_vars = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OPENAI_API_KEY", "OPENAI_ASSISTANT_ID"]
     if not all(os.environ.get(var) for var in required_vars):
-        logging.error(f"Missing required environment variables. Need: {', '.join(required_vars)}")
+        missing = [var for var in required_vars if not os.environ.get(var)]
+        logging.error(f"Missing required environment variables: {', '.join(missing)}")
     elif not BOT_USER_ID:
          logging.error("Failed to get bot user ID. Bot cannot start.")
     else:
