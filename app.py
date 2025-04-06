@@ -10,6 +10,7 @@ from openai import OpenAI, OpenAIError
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 load_dotenv() # Load environment variables from .env file
 
 # --- Constants ---
