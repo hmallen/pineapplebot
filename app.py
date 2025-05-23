@@ -276,9 +276,7 @@ def handle_message_events(message, say, logger):
     # Call the refactored processing function
     process_with_assistant(prompt, slack_thread_ts, channel_id, user_id, say, logger)
 
-
-# --- Start the Bot ---
-if __name__ == "__main__":
+def run():
     required_vars = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "OPENAI_API_KEY", "OPENAI_ASSISTANT_ID"]
     if not all(os.environ.get(var) for var in required_vars):
         missing = [var for var in required_vars if not os.environ.get(var)]
@@ -291,3 +289,7 @@ if __name__ == "__main__":
         logger.info("Starting bot in Socket Mode...")
         handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
         handler.start()
+
+# --- Start the Bot ---
+if __name__ == "__main__":
+    run()
