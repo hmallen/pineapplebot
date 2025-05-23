@@ -1,0 +1,14 @@
+[Unit]
+Description=Pineapple Bot Flask App
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/pineapplebot
+Environment="PATH=/home/ubuntu/pineapplebot/env/bin"
+ExecStart=/home/ubuntu/pineapplebot/env/bin/python wsgi.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
